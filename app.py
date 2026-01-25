@@ -396,6 +396,205 @@ def webhook():
             "example_url": "https://tradingview-proxy-h71n.onrender.com/test"
         }), 500
 
+@app.route('/signals', methods=['GET'])
+def get_signals():
+    """Получить все сохраненные сигналы"""
+    try:
+        limit = request.args.get('limit', 50, type=int)
+        symbol = request.args.get('symbol')
+        
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({
+                "status": "error",
+                "message": "Database not connected",
+                "signals": []
+            }), 200
+        
+        cur = conn.cursor()
+        
+        if symbol:
+            cur.execute('''
+                SELECT id, symbol, signal, price, strength, timeframe, timestamp, processed, status, raw_data
+                FROM trading_signals
+                WHERE symbol = %s
+                ORDER BY timestamp DESC
+                LIMIT %s
+            ''', (symbol.upper(), limit))
+        else:
+            cur.execute('''
+                SELECT id, symbol, signal, price, strength, timeframe, timestamp, processed, status, raw_data
+                FROM trading_signals
+                ORDER BY timestamp DESC
+                LIMIT %s
+            ''', (limit,))
+        
+        signals = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        result = []
+        for sig in signals:
+            result.append({
+                "id": sig[0],
+                "symbol": sig[1],
+                "signal": sig[2],
+                "price": float(sig[3]),
+                "strength": float(sig[4]) if sig[4] else None,
+                "timeframe": sig[5],
+                "timestamp": sig[6].isoformat() if sig[6] else None,
+                "processed": sig[7],
+                "status": sig[8],
+                "raw_data": sig[9]
+            })
+        
+        return jsonify({
+            "status": "success",
+            "count": len(result),
+            "signals": result
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения сигналов: {e}")
+        return jsonify({"error": str(e), "signals": []}), 500
+
+@app.route('/signals/active', methods=['GET'])
+def get_active_signals():
+    """Получить только непрочитанные сигналы"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({
+                "status": "error",
+                "message": "Database not connected",
+                "signals": []
+            }), 200
+        
+        cur = conn.cursor()
+        cur.execute('''
+            SELECT id, symbol, signal, price, strength, timeframe, timestamp, status, raw_data
+            FROM trading_signals
+            WHERE processed = FALSE AND status = 'active'
+            ORDER BY timestamp DESC
+        ''')
+        
+        signals = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        result = []
+        for sig in signals:
+            result.append({
+                "id": sig[0],
+                "symbol": sig[1],
+                "signal": sig[2],
+                "price": float(sig[3]),
+                "strength": float(sig[4]) if sig[4] else None,
+                "timeframe": sig[5],
+                "timestamp": sig[6].isoformat() if sig[6] else None,
+                "status": sig[7],
+                "raw_data": sig[8]
+            })
+        
+        return jsonify({
+            "status": "success",
+            "count": len(result),
+            "signals": result
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения активных сигналов: {e}")
+        return jsonify({"error": str(e), "signals": []}), 500
+
+@app.route('/signals/<int:signal_id>', methods=['GET'])
+def get_signal_by_id(signal_id):
+    """Получить конкретный сигнал по ID"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({
+                "status": "error",
+                "message": "Database not connected"
+            }), 200
+        
+        cur = conn.cursor()
+        cur.execute('''
+            SELECT id, symbol, signal, price, strength, timeframe, timestamp, processed, status, raw_data
+            FROM trading_signals
+            WHERE id = %s
+        ''', (signal_id,))
+        
+        signal = cur.fetchone()
+        cur.close()
+        conn.close()
+        
+        if not signal:
+            return jsonify({
+                "status": "error",
+                "message": f"Signal with ID {signal_id} not found"
+            }), 404
+        
+        result = {
+            "id": signal[0],
+            "symbol": signal[1],
+            "signal": signal[2],
+            "price": float(signal[3]),
+            "strength": float(signal[4]) if signal[4] else None,
+            "timeframe": signal[5],
+            "timestamp": signal[6].isoformat() if signal[6] else None,
+            "processed": signal[7],
+            "status": signal[8],
+            "raw_data": signal[9]
+        }
+        
+        return jsonify({
+            "status": "success",
+            "signal": result
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения сигнала: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/signals/<int:signal_id>/mark_processed', methods=['POST'])
+def mark_signal_processed(signal_id):
+    """Пометить сигнал как обработанный"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({
+                "status": "error",
+                "message": "Database not connected"
+            }), 200
+        
+        cur = conn.cursor()
+        cur.execute('''
+            UPDATE trading_signals
+            SET processed = TRUE
+            WHERE id = %s
+            RETURNING id, symbol, signal
+        ''', (signal_id,))
+        
+        updated = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        if not updated:
+            return jsonify({
+                "status": "error",
+                "message": f"Signal with ID {signal_id} not found"
+            }), 404
+        
+        return jsonify({
+            "status": "success",
+            "message": f"Signal {signal_id} ({updated[1]} {updated[2]}) marked as processed"
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка обновления сигнала: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/test', methods=['GET', 'POST'])
 def test_webhook():
     """Страница для тестирования вебхука"""
@@ -623,3 +822,10 @@ SOLUSDT LONG @ 100
     </body>
     </html>
     '''
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 10000))
+    logger.info(f"🚀 Сервис запущен на порту {port}")
+    logger.info(f"📡 Webhook URL: https://tradingview-proxy-h71n.onrender.com/webhook")
+    logger.info(f"💾 Database: {'connected' if get_db_connection() else 'disconnected'}")
+    app.run(host='0.0.0.0', port=port, debug=False)
