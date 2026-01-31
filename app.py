@@ -1,6 +1,7 @@
 import os
 import json
 import psycopg2
+import urllib.parse
 from datetime import datetime
 from flask import Flask, request, jsonify
 import logging
@@ -11,21 +12,25 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 def get_db_connection():
-    database_url = os.environ.get('DATABASE_URL')
-    if not database_url:
-        logger.error("DATABASE_URL not set")
-        return None
+    """Подключение к базе данных с обработкой ошибок"""
     try:
+        database_url = os.environ.get('DATABASE_URL')
+        if not database_url:
+            logger.error("DATABASE_URL not set")
+            return None
+        
         # Исправляем URL для psycopg2
         if database_url.startswith("postgres://"):
             database_url = database_url.replace("postgres://", "postgresql://", 1)
+        
         conn = psycopg2.connect(database_url, sslmode='require')
         return conn
     except Exception as e:
-        logger.error(f"DB connection error: {e}")
+        logger.error(f"❌ DB connection error: {e}")
         return None
 
 def init_database():
+    """Инициализация таблиц базы данных"""
     conn = get_db_connection()
     if not conn:
         return False
@@ -33,38 +38,40 @@ def init_database():
     try:
         cur = conn.cursor()
         
-        # 1. Существующая таблица для совместимости
+        # 1. Основная таблица сигналов (увеличиваем длину signal до 50)
         cur.execute('''
             CREATE TABLE IF NOT EXISTS trading_signals (
                 id SERIAL PRIMARY KEY,
-                symbol VARCHAR(20) NOT NULL,
-                signal VARCHAR(10) NOT NULL,
-                price DECIMAL(15, 5) NOT NULL,
+                symbol VARCHAR(50) NOT NULL,
+                signal VARCHAR(50) NOT NULL,
+                price DECIMAL(20, 8) NOT NULL,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                processed BOOLEAN DEFAULT FALSE
+                processed BOOLEAN DEFAULT FALSE,
+                source VARCHAR(50) DEFAULT 'unknown'
             )
         ''')
         
-        # 2. НОВАЯ таблица для расширенных данных KIRA
+        # 2. Расширенная таблица KIRA (храним ВСЕ данные)
         cur.execute('''
             CREATE TABLE IF NOT EXISTS kiria_full_signals (
                 id SERIAL PRIMARY KEY,
-                signal_id INTEGER REFERENCES trading_signals(id),
+                signal_id INTEGER REFERENCES trading_signals(id) ON DELETE CASCADE,
                 full_data JSONB NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
-        # 3. Индекс для быстрого поиска
+        # 3. Индексы для быстрого поиска
         cur.execute('CREATE INDEX IF NOT EXISTS idx_kiria_signal_id ON kiria_full_signals(signal_id)')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON trading_signals(timestamp DESC)')
         
         conn.commit()
         cur.close()
         conn.close()
-        logger.info("✅ Database tables initialized (including KIRA tables)")
+        logger.info("✅ Database tables initialized (with KIRA support)")
         return True
     except Exception as e:
-        logger.error(f"DB init error: {e}")
+        logger.error(f"❌ DB init error: {e}")
         return False
 
 init_database()
@@ -74,15 +81,14 @@ def home():
     return jsonify({
         "service": "TradingView Proxy API",
         "status": "running",
-        "version": "2.0 (with KIRA support)",
+        "version": "3.0 (KIRA Super-Compatible)",
         "webhook_url": "https://tradingview-proxy-h71n.onrender.com/webhook",
         "endpoints": {
             "health": "/health",
-            "webhook": "/webhook (POST)",
+            "webhook": "/webhook (POST/GET)",
             "signals": "/signals (GET)",
-            "active_signals": "/signals/active (GET)",
-            "kiria_signals": "/kiria/signals (GET)",  # НОВЫЙ
-            "kiria_signal_by_id": "/kiria/signal/<id> (GET)"  # НОВЫЙ
+            "kiria_signals": "/kiria/signals (GET)",
+            "delete_all": "/delete_all (DELETE) - очистить все сигналы"
         }
     })
 
@@ -92,7 +98,6 @@ def health():
         conn = get_db_connection()
         if conn:
             cur = conn.cursor()
-            # Проверяем обе таблицы
             cur.execute("SELECT COUNT(*) FROM trading_signals")
             trading_count = cur.fetchone()[0]
             
@@ -114,193 +119,201 @@ def health():
             "status": "healthy",
             "database": db_status,
             "timestamp": datetime.now().isoformat(),
-            "version": "2.0"
+            "version": "3.0"
         })
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
-@app.route('/webhook', methods=['POST'])
-def webhook():
+def extract_signal_info(data):
+    """Извлекает информацию о сигнале из любых данных"""
+    # Безопасное извлечение с значениями по умолчанию
+    symbol = str(data.get('symbol') or data.get('ticker') or 'UNKNOWN')[:50]
+    
+    # Сигнал может быть в разных полях
+    signal = str(
+        data.get('signal') or 
+        data.get('action') or 
+        data.get('order') or 
+        data.get('alert_type') or 
+        'UNKNOWN'
+    )[:50]
+    
+    # Пробуем получить цену разными способами
+    price_value = data.get('price') or data.get('close') or data.get('value') or 0
     try:
-        data = request.json
+        price = float(price_value)
+    except (ValueError, TypeError):
+        price = 0.0
+    
+    return {
+        'symbol': symbol.upper(),
+        'signal': signal.upper(),
+        'price': price,
+        'source': data.get('source', 'unknown')
+    }
+
+@app.route('/webhook', methods=['POST', 'GET', 'PUT', 'OPTIONS'])
+def webhook():
+    """Универсальный вебхук для TradingView - принимает ВСЁ"""
+    try:
+        data = {}
+        content_type = request.content_type or ''
         
+        logger.info(f"📨 Получен запрос: {request.method}, Content-Type: {content_type}")
+        
+        # 🔥 ВАЖНО: Принимаем ЛЮБОЙ формат данных
+        
+        # 1. JSON (нормальный запрос)
+        if request.is_json:
+            try:
+                data = request.get_json()
+                logger.info("✅ Данные получены как JSON")
+            except:
+                logger.warning("⚠️ Не удалось распарсить JSON")
+        
+        # 2. Form-data (HTML формы)
+        elif 'form-data' in content_type or 'x-www-form-urlencoded' in content_type:
+            if request.form:
+                data = request.form.to_dict()
+                logger.info(f"✅ Данные получены как form-data: {len(data)} полей")
+        
+        # 3. Raw text/plain (часто TradingView так отправляет)
+        elif 'text/plain' in content_type or request.data:
+            try:
+                raw_text = request.data.decode('utf-8')
+                logger.info(f"📝 Raw данные: {raw_text[:200]}...")
+                
+                # Пробуем разные форматы:
+                
+                # JSON в тексте
+                if raw_text.strip().startswith('{'):
+                    try:
+                        data = json.loads(raw_text)
+                        logger.info("✅ Raw текст распознан как JSON")
+                    except json.JSONDecodeError:
+                        # Может быть JSON с лишними символами
+                        cleaned = raw_text.strip()
+                        if cleaned.startswith('"') and cleaned.endswith('"'):
+                            cleaned = cleaned[1:-1]
+                        try:
+                            data = json.loads(cleaned)
+                        except:
+                            data = {'raw': raw_text}
+                
+                # URL encoded (symbol=BTC&price=50000)
+                elif '=' in raw_text and ('&' in raw_text or '\n' in raw_text):
+                    try:
+                        # Заменяем переносы строк на &
+                        normalized = raw_text.replace('\n', '&').replace('\r', '')
+                        parsed = urllib.parse.parse_qs(normalized)
+                        data = {k: v[0] if len(v) == 1 else v for k, v in parsed.items()}
+                        logger.info("✅ Raw текст распознан как URL encoded")
+                    except:
+                        data = {'raw': raw_text}
+                
+                # Просто текст
+                else:
+                    data = {'message': raw_text}
+                    
+            except Exception as e:
+                logger.error(f"❌ Ошибка обработки raw данных: {e}")
+                data = {'error': str(e), 'raw_bytes': len(request.data)}
+        
+        # 4. GET параметры (для тестирования через браузер)
+        elif request.method == 'GET':
+            data = request.args.to_dict()
+            logger.info(f"🔗 GET параметры: {data}")
+        
+        # 5. Если ничего не получили
         if not data:
-            return jsonify({"error": "No JSON data"}), 400
+            logger.warning("⚠️ Пустой запрос без данных")
+            return jsonify({
+                "status": "warning",
+                "message": "Empty request received",
+                "tip": "Send JSON with symbol, signal, price"
+            }), 200
         
-        # Основные обязательные поля
-        symbol = data.get('symbol', '').upper()
-        signal = data.get('signal', '').upper()
+        # 🔍 ИЗВЛЕКАЕМ ДАННЫЕ СИГНАЛА
+        signal_info = extract_signal_info(data)
+        symbol = signal_info['symbol']
+        signal = signal_info['signal']
+        price = signal_info['price']
         
-        try:
-            price = float(data.get('price', 0))
-        except:
-            return jsonify({"error": "Invalid price"}), 400
+        # Если нет обязательных данных
+        if symbol == 'UNKNOWN' or signal == 'UNKNOWN' or price == 0:
+            logger.warning(f"⚠️ Неполные данные: {symbol} {signal} ${price}")
         
-        if not symbol or not signal or price <= 0:
-            return jsonify({"error": "Missing required fields"}), 400
-        
+        # 📊 СОХРАНЕНИЕ В БАЗУ
         conn = get_db_connection()
         if not conn:
             return jsonify({"error": "Database not connected"}), 500
         
         cur = conn.cursor()
         
-        # 1. Сохраняем в основную таблицу (для совместимости)
-        cur.execute('''
-            INSERT INTO trading_signals (symbol, signal, price)
-            VALUES (%s, %s, %s)
-            RETURNING id, timestamp
-        ''', (symbol, signal, price))
+        try:
+            # Сохраняем в основную таблицу
+            cur.execute('''
+                INSERT INTO trading_signals (symbol, signal, price, source)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id, timestamp
+            ''', (symbol, signal, price, content_type))
+            
+            signal_id, timestamp = cur.fetchone()
+            
+            # Сохраняем ВСЕ исходные данные в KIRA таблицу
+            cur.execute('''
+                INSERT INTO kiria_full_signals (signal_id, full_data)
+                VALUES (%s, %s)
+            ''', (signal_id, json.dumps(data)))
+            
+            conn.commit()
+            
+            # 📝 ЛОГИРОВАНИЕ
+            logger.info(f"✅ Сигнал сохранен: {symbol} {signal} ${price:.2f} (ID: {signal_id})")
+            
+            # Проверяем наличие KIRA данных
+            kira_keys = ['monitoring_minutes', 'delta_15min', 'bull_percent', 'dominance']
+            has_kira = any(key in data for key in kira_keys)
+            
+            if has_kira:
+                kira_info = {k: data.get(k) for k in kira_keys if k in data}
+                logger.info(f"   📊 KIRA данные: {kira_info}")
+            
+        except Exception as db_error:
+            conn.rollback()
+            logger.error(f"❌ Ошибка базы данных: {db_error}")
+            return jsonify({"error": f"Database error: {db_error}"}), 500
+        finally:
+            cur.close()
+            conn.close()
         
-        signal_id, timestamp = cur.fetchone()
-        
-        # 2. Сохраняем ВСЕ данные в KIRA таблицу
-        cur.execute('''
-            INSERT INTO kiria_full_signals (signal_id, full_data)
-            VALUES (%s, %s)
-        ''', (signal_id, json.dumps(data)))
-        
-        conn.commit()
-        cur.close()
-        conn.close()
-        
-        # Логируем расширенные данные, если они есть
-        has_kiria_data = any(key in data for key in [
-            'monitoring_minutes', 'delta_15min', 
-            'total_delta_90min', 'bull_percent', 'dominance'
-        ])
-        
-        logger.info(f"📥 Signal saved: {symbol} {signal} (ID: {signal_id})")
-        if has_kiria_data:
-            logger.info(f"   📊 KIRA data included: monitoring={data.get('monitoring_minutes')}min, bull={data.get('bull_percent')}%")
-        
+        # ✅ УСПЕШНЫЙ ОТВЕТ
         return jsonify({
             "status": "success",
-            "message": "Signal saved with full KIRA data",
+            "message": "Signal received and saved",
             "signal_id": signal_id,
             "data": {
                 "symbol": symbol,
                 "signal": signal,
                 "price": price,
-                "timestamp": timestamp.isoformat(),
-                "has_kiria_data": has_kiria_data,
-                "kiria_fields": {
-                    "monitoring_minutes": data.get('monitoring_minutes'),
-                    "delta_15min": data.get('delta_15min'),
-                    "bull_percent": data.get('bull_percent'),
-                    "dominance": data.get('dominance')
-                }
+                "timestamp": timestamp.isoformat() if timestamp else None,
+                "format_received": content_type,
+                "has_kira_data": has_kira
             }
-        })
+        }), 200
         
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-# НОВЫЙ ЭНДПОИНТ: Получение расширенных данных KIRA
-@app.route('/kiria/signals')
-def get_kiria_signals():
-    """Возвращает все сигналы с расширенными данными KIRA"""
-    try:
-        conn = get_db_connection()
-        if not conn:
-            return jsonify({"error": "Database not connected"}), 500
-        
-        # Параметры запроса
-        limit = request.args.get('limit', default=50, type=int)
-        offset = request.args.get('offset', default=0, type=int)
-        
-        cur = conn.cursor()
-        
-        # Проверяем, есть ли таблица kiria_full_signals
-        cur.execute("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'kiria_full_signals')")
-        table_exists = cur.fetchone()[0]
-        
-        if not table_exists:
-            cur.close()
-            conn.close()
-            return jsonify({
-                "status": "success",
-                "message": "KIRA table not initialized yet",
-                "count": 0,
-                "signals": []
-            })
-        
-        # Получаем данные с объединением таблиц
-        cur.execute('''
-            SELECT 
-                ts.id,
-                ts.symbol,
-                ts.signal,
-                ts.price,
-                ts.timestamp,
-                kfs.full_data
-            FROM trading_signals ts
-            LEFT JOIN kiria_full_signals kfs ON ts.id = kfs.signal_id
-            ORDER BY ts.timestamp DESC
-            LIMIT %s OFFSET %s
-        ''', (limit, offset))
-        
-        signals = []
-        for row in cur.fetchall():
-            signal_id = row[0]
-            full_data = row[5]  # JSON данные
-            
-            # Парсим JSON если он есть
-            kiria_data = {}
-            if full_data:
-                try:
-                    kiria_data = json.loads(full_data) if isinstance(full_data, str) else full_data
-                except:
-                    kiria_data = {}
-            
-            # Формируем ответ
-            signal_info = {
-                "id": signal_id,
-                "symbol": row[1],
-                "signal": row[2],
-                "price": float(row[3]),
-                "timestamp": row[4].isoformat() if row[4] else None,
-                "has_kiria_data": bool(full_data),
-                "monitoring_minutes": kiria_data.get("monitoring_minutes", 0),
-                "delta_15min": float(kiria_data.get("delta_15min", 0)),
-                "total_delta_90min": float(kiria_data.get("total_delta_90min", 0)),
-                "bull_percent": float(kiria_data.get("bull_percent", 50)),
-                "dominance": kiria_data.get("dominance", ""),
-                "channel_data": kiria_data.get("channel_data", {})
-            }
-            
-            # Добавляем все остальные поля из KIRA данных
-            for key, value in kiria_data.items():
-                if key not in signal_info:
-                    signal_info[key] = value
-            
-            signals.append(signal_info)
-        
-        # Получаем общее количество
-        cur.execute("SELECT COUNT(*) FROM trading_signals")
-        total_count = cur.fetchone()[0]
-        
-        cur.close()
-        conn.close()
-        
+        logger.error(f"❌ Ошибка вебхука: {e}", exc_info=True)
         return jsonify({
-            "status": "success",
-            "count": len(signals),
-            "total": total_count,
-            "limit": limit,
-            "offset": offset,
-            "signals": signals
-        })
-        
-    except Exception as e:
-        logger.error(f"Error in get_kiria_signals: {e}")
-        return jsonify({"error": str(e)}), 500
+            "status": "error",
+            "error": str(e),
+            "tip": "Check your data format. Send JSON like: {\"symbol\":\"BTC\",\"signal\":\"BUY\",\"price\":50000}"
+        }), 500
 
-# НОВЫЙ ЭНДПОИНТ: Получение одного сигнала KIRA по ID
-@app.route('/kiria/signal/<int:signal_id>')
-def get_kiria_signal(signal_id):
-    """Возвращает один сигнал с расширенными данными KIRA по ID"""
+# 🗑️ Очистка всех сигналов (для тестирования)
+@app.route('/delete_all', methods=['DELETE', 'POST'])
+def delete_all_signals():
+    """Удаляет все сигналы (осторожно!)"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -308,65 +321,25 @@ def get_kiria_signal(signal_id):
         
         cur = conn.cursor()
         
-        cur.execute('''
-            SELECT 
-                ts.id,
-                ts.symbol,
-                ts.signal,
-                ts.price,
-                ts.timestamp,
-                kfs.full_data
-            FROM trading_signals ts
-            LEFT JOIN kiria_full_signals kfs ON ts.id = kfs.signal_id
-            WHERE ts.id = %s
-        ''', (signal_id,))
+        # Удаляем в правильном порядке из-за foreign key
+        cur.execute("DELETE FROM kiria_full_signals")
+        cur.execute("DELETE FROM trading_signals")
         
-        row = cur.fetchone()
-        
-        if not row:
-            cur.close()
-            conn.close()
-            return jsonify({"error": "Signal not found"}), 404
-        
-        # Парсим JSON данные
-        full_data = row[5]
-        kiria_data = {}
-        if full_data:
-            try:
-                kiria_data = json.loads(full_data) if isinstance(full_data, str) else full_data
-            except:
-                kiria_data = {}
-        
-        # Формируем ответ
-        signal_info = {
-            "id": row[0],
-            "symbol": row[1],
-            "signal": row[2],
-            "price": float(row[3]),
-            "timestamp": row[4].isoformat() if row[4] else None,
-            "has_kiria_data": bool(full_data),
-            "monitoring_minutes": kiria_data.get("monitoring_minutes", 0),
-            "delta_15min": float(kiria_data.get("delta_15min", 0)),
-            "total_delta_90min": float(kiria_data.get("total_delta_90min", 0)),
-            "bull_percent": float(kiria_data.get("bull_percent", 50)),
-            "dominance": kiria_data.get("dominance", ""),
-            "channel_data": kiria_data.get("channel_data", {}),
-            "full_kiria_data": kiria_data  # Все данные целиком
-        }
-        
+        conn.commit()
         cur.close()
         conn.close()
         
+        logger.warning("⚠️ Все сигналы удалены!")
+        
         return jsonify({
             "status": "success",
-            "signal": signal_info
+            "message": "All signals deleted",
+            "timestamp": datetime.now().isoformat()
         })
-        
     except Exception as e:
-        logger.error(f"Error in get_kiria_signal: {e}")
         return jsonify({"error": str(e)}), 500
 
-# Существующие эндпоинты (оставляем без изменений)
+# 📊 Получение всех сигналов
 @app.route('/signals')
 def get_signals():
     try:
@@ -374,15 +347,16 @@ def get_signals():
         if not conn:
             return jsonify({"error": "Database not connected"}), 500
         
-        limit = request.args.get('limit', default=50, type=int)
+        limit = min(int(request.args.get('limit', 50)), 1000)
+        offset = int(request.args.get('offset', 0))
         
         cur = conn.cursor()
         cur.execute('''
-            SELECT id, symbol, signal, price, timestamp, processed 
+            SELECT id, symbol, signal, price, timestamp, source 
             FROM trading_signals 
             ORDER BY timestamp DESC 
-            LIMIT %s
-        ''', (limit,))
+            LIMIT %s OFFSET %s
+        ''', (limit, offset))
         
         signals = []
         for row in cur.fetchall():
@@ -391,9 +365,12 @@ def get_signals():
                 "symbol": row[1],
                 "signal": row[2],
                 "price": float(row[3]),
-                "timestamp": row[4].isoformat(),
-                "processed": row[5]
+                "timestamp": row[4].isoformat() if row[4] else None,
+                "source": row[5]
             })
+        
+        cur.execute("SELECT COUNT(*) FROM trading_signals")
+        total = cur.fetchone()[0]
         
         cur.close()
         conn.close()
@@ -401,35 +378,76 @@ def get_signals():
         return jsonify({
             "status": "success",
             "count": len(signals),
+            "total": total,
             "signals": signals
         })
-        
     except Exception as e:
+        logger.error(f"Error in get_signals: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route('/signals/active')
-def get_active_signals():
+# 📈 Получение KIRA сигналов
+@app.route('/kiria/signals')
+def get_kiria_signals():
     try:
         conn = get_db_connection()
         if not conn:
             return jsonify({"error": "Database not connected"}), 500
         
+        limit = min(int(request.args.get('limit', 50)), 1000)
+        
         cur = conn.cursor()
+        
+        # Проверяем существование таблицы
+        cur.execute("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'kiria_full_signals')")
+        if not cur.fetchone()[0]:
+            cur.close()
+            conn.close()
+            return jsonify({
+                "status": "success",
+                "message": "KIRA table not created yet",
+                "signals": []
+            })
+        
         cur.execute('''
-            SELECT id, symbol, signal, price, timestamp 
-            FROM trading_signals 
-            WHERE processed = FALSE 
-            ORDER BY timestamp DESC
-        ''')
+            SELECT 
+                ts.id,
+                ts.symbol,
+                ts.signal,
+                ts.price,
+                ts.timestamp,
+                kfs.full_data
+            FROM trading_signals ts
+            LEFT JOIN kiria_full_signals kfs ON ts.id = kfs.signal_id
+            WHERE kfs.full_data IS NOT NULL
+            ORDER BY ts.timestamp DESC
+            LIMIT %s
+        ''', (limit,))
         
         signals = []
         for row in cur.fetchall():
+            try:
+                full_data = json.loads(row[5]) if isinstance(row[5], str) else row[5]
+            except:
+                full_data = {}
+            
+            # Извлекаем KIRA поля
+            kira_data = {
+                "monitoring_minutes": full_data.get('monitoring_minutes', 0),
+                "delta_15min": full_data.get('delta_15min', 0),
+                "total_delta_90min": full_data.get('total_delta_90min', 0),
+                "bull_percent": full_data.get('bull_percent', 50),
+                "dominance": full_data.get('dominance', 'NEUTRAL'),
+                "channel_data": full_data.get('channel_data', {})
+            }
+            
             signals.append({
                 "id": row[0],
                 "symbol": row[1],
                 "signal": row[2],
                 "price": float(row[3]),
-                "timestamp": row[4].isoformat()
+                "timestamp": row[4].isoformat() if row[4] else None,
+                "kira_data": kira_data,
+                "full_data": full_data
             })
         
         cur.close()
@@ -440,14 +458,17 @@ def get_active_signals():
             "count": len(signals),
             "signals": signals
         })
-        
     except Exception as e:
+        logger.error(f"Error in get_kiria_signals: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
-    logger.info(f"🚀 Server starting on port {port}")
-    logger.info(f"✅ KIRA endpoints available:")
-    logger.info(f"   - GET /kiria/signals")
-    logger.info(f"   - GET /kiria/signal/<id>")
-    app.run(host='0.0.0.0', port=port)
+    logger.info(f"🚀 KIRA TradingView Proxy запущен на порту {port}")
+    logger.info(f"🌐 Доступ по URL: https://tradingview-proxy-h71n.onrender.com")
+    logger.info(f"✅ Вебхук URL: https://tradingview-proxy-h71n.onrender.com/webhook")
+    logger.info(f"📊 KIRA эндпоинты:")
+    logger.info(f"   - GET /signals - все сигналы")
+    logger.info(f"   - GET /kiria/signals - KIRA сигналы")
+    logger.info(f"   - DELETE /delete_all - очистить все (для тестов)")
+    app.run(host='0.0.0.0', port=port, debug=False)
