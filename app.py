@@ -12,14 +12,13 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 def get_db_connection():
-    """Подключение к базе данных с обработкой ошибок"""
+    """Подключение к базе данных"""
     try:
         database_url = os.environ.get('DATABASE_URL')
         if not database_url:
             logger.error("DATABASE_URL not set")
             return None
         
-        # Исправляем URL для psycopg2
         if database_url.startswith("postgres://"):
             database_url = database_url.replace("postgres://", "postgresql://", 1)
         
@@ -30,7 +29,7 @@ def get_db_connection():
         return None
 
 def init_database():
-    """Инициализация таблиц базы данных"""
+    """Инициализация таблиц базы данных с исправлением структуры"""
     conn = get_db_connection()
     if not conn:
         return False
@@ -38,7 +37,7 @@ def init_database():
     try:
         cur = conn.cursor()
         
-        # 1. Основная таблица сигналов (увеличиваем длину signal до 50)
+        # 1. Основная таблица сигналов
         cur.execute('''
             CREATE TABLE IF NOT EXISTS trading_signals (
                 id SERIAL PRIMARY KEY,
@@ -46,12 +45,11 @@ def init_database():
                 signal VARCHAR(50) NOT NULL,
                 price DECIMAL(20, 8) NOT NULL,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                processed BOOLEAN DEFAULT FALSE,
-                source VARCHAR(50) DEFAULT 'unknown'
+                processed BOOLEAN DEFAULT FALSE
             )
         ''')
         
-        # 2. Расширенная таблица KIRA (храним ВСЕ данные)
+        # 2. Расширенная таблица KIRA
         cur.execute('''
             CREATE TABLE IF NOT EXISTS kiria_full_signals (
                 id SERIAL PRIMARY KEY,
@@ -61,14 +59,22 @@ def init_database():
             )
         ''')
         
-        # 3. Индексы для быстрого поиска
+        # 3. Добавляем колонку source, если её нет (исправление ошибки)
+        try:
+            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='trading_signals' AND column_name='source'")
+            if not cur.fetchone():
+                cur.execute("ALTER TABLE trading_signals ADD COLUMN source VARCHAR(50) DEFAULT 'unknown'")
+                logger.info("✅ Добавлена колонка 'source' в таблицу trading_signals")
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось добавить колонку source: {e}")
+        
+        # 4. Создаём индексы
         cur.execute('CREATE INDEX IF NOT EXISTS idx_kiria_signal_id ON kiria_full_signals(signal_id)')
-        cur.execute('CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON trading_signals(timestamp DESC)')
         
         conn.commit()
         cur.close()
         conn.close()
-        logger.info("✅ Database tables initialized (with KIRA support)")
+        logger.info("✅ Таблицы базы данных инициализированы")
         return True
     except Exception as e:
         logger.error(f"❌ DB init error: {e}")
@@ -81,14 +87,14 @@ def home():
     return jsonify({
         "service": "TradingView Proxy API",
         "status": "running",
-        "version": "3.0 (KIRA Super-Compatible)",
+        "version": "3.1 (Fixed Structure)",
         "webhook_url": "https://tradingview-proxy-h71n.onrender.com/webhook",
         "endpoints": {
             "health": "/health",
             "webhook": "/webhook (POST/GET)",
             "signals": "/signals (GET)",
             "kiria_signals": "/kiria/signals (GET)",
-            "delete_all": "/delete_all (DELETE) - очистить все сигналы"
+            "fix_database": "/fix_db (GET) - исправить структуру БД"
         }
     })
 
@@ -104,12 +110,22 @@ def health():
             cur.execute("SELECT COUNT(*) FROM kiria_full_signals")
             kiria_count = cur.fetchone()[0]
             
+            # Проверяем структуру таблицы
+            cur.execute("""
+                SELECT column_name, data_type 
+                FROM information_schema.columns 
+                WHERE table_name = 'trading_signals'
+                ORDER BY ordinal_position
+            """)
+            columns = [{"name": row[0], "type": row[1]} for row in cur.fetchall()]
+            
             cur.close()
             conn.close()
             
             db_status = {
                 "trading_signals": trading_count,
                 "kiria_full_signals": kiria_count,
+                "columns": columns,
                 "status": "connected"
             }
         else:
@@ -119,131 +135,116 @@ def health():
             "status": "healthy",
             "database": db_status,
             "timestamp": datetime.now().isoformat(),
-            "version": "3.0"
+            "version": "3.1"
         })
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
-def extract_signal_info(data):
-    """Извлекает информацию о сигнале из любых данных"""
-    # Безопасное извлечение с значениями по умолчанию
-    symbol = str(data.get('symbol') or data.get('ticker') or 'UNKNOWN')[:50]
-    
-    # Сигнал может быть в разных полях
-    signal = str(
-        data.get('signal') or 
-        data.get('action') or 
-        data.get('order') or 
-        data.get('alert_type') or 
-        'UNKNOWN'
-    )[:50]
-    
-    # Пробуем получить цену разными способами
-    price_value = data.get('price') or data.get('close') or data.get('value') or 0
+@app.route('/fix_db')
+def fix_database():
+    """Ручное исправление структуры базы данных"""
     try:
-        price = float(price_value)
-    except (ValueError, TypeError):
-        price = 0.0
-    
-    return {
-        'symbol': symbol.upper(),
-        'signal': signal.upper(),
-        'price': price,
-        'source': data.get('source', 'unknown')
-    }
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({"error": "Database not connected"}), 500
+        
+        cur = conn.cursor()
+        
+        # Добавляем колонку source если её нет
+        try:
+            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='trading_signals' AND column_name='source'")
+            if not cur.fetchone():
+                cur.execute("ALTER TABLE trading_signals ADD COLUMN source VARCHAR(50) DEFAULT 'unknown'")
+                logger.info("✅ Колонка 'source' добавлена")
+            else:
+                logger.info("✅ Колонка 'source' уже существует")
+        except Exception as e:
+            logger.error(f"❌ Ошибка добавления колонки: {e}")
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        return jsonify({
+            "status": "success",
+            "message": "Database structure fixed",
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-@app.route('/webhook', methods=['POST', 'GET', 'PUT', 'OPTIONS'])
+@app.route('/webhook', methods=['POST', 'GET'])
 def webhook():
-    """Универсальный вебхук для TradingView - принимает ВСЁ"""
+    """Универсальный вебхук для TradingView"""
     try:
         data = {}
-        content_type = request.content_type or ''
         
-        logger.info(f"📨 Получен запрос: {request.method}, Content-Type: {content_type}")
+        # 🔥 ПРИНИМАЕМ ВСЁ что угодно
         
-        # 🔥 ВАЖНО: Принимаем ЛЮБОЙ формат данных
-        
-        # 1. JSON (нормальный запрос)
+        # 1. JSON
         if request.is_json:
             try:
                 data = request.get_json()
-                logger.info("✅ Данные получены как JSON")
+                logger.info("✅ Получен JSON")
             except:
-                logger.warning("⚠️ Не удалось распарсить JSON")
+                pass
         
-        # 2. Form-data (HTML формы)
-        elif 'form-data' in content_type or 'x-www-form-urlencoded' in content_type:
-            if request.form:
-                data = request.form.to_dict()
-                logger.info(f"✅ Данные получены как form-data: {len(data)} полей")
-        
-        # 3. Raw text/plain (часто TradingView так отправляет)
-        elif 'text/plain' in content_type or request.data:
+        # 2. Raw text (TradingView часто так отправляет)
+        if not data and request.data:
             try:
                 raw_text = request.data.decode('utf-8')
                 logger.info(f"📝 Raw данные: {raw_text[:200]}...")
                 
-                # Пробуем разные форматы:
-                
-                # JSON в тексте
+                # Пробуем распарсить как JSON
                 if raw_text.strip().startswith('{'):
                     try:
                         data = json.loads(raw_text)
-                        logger.info("✅ Raw текст распознан как JSON")
-                    except json.JSONDecodeError:
-                        # Может быть JSON с лишними символами
-                        cleaned = raw_text.strip()
-                        if cleaned.startswith('"') and cleaned.endswith('"'):
-                            cleaned = cleaned[1:-1]
-                        try:
-                            data = json.loads(cleaned)
-                        except:
-                            data = {'raw': raw_text}
-                
-                # URL encoded (symbol=BTC&price=50000)
-                elif '=' in raw_text and ('&' in raw_text or '\n' in raw_text):
-                    try:
-                        # Заменяем переносы строк на &
-                        normalized = raw_text.replace('\n', '&').replace('\r', '')
-                        parsed = urllib.parse.parse_qs(normalized)
-                        data = {k: v[0] if len(v) == 1 else v for k, v in parsed.items()}
-                        logger.info("✅ Raw текст распознан как URL encoded")
                     except:
-                        data = {'raw': raw_text}
-                
-                # Просто текст
+                        # Может быть JSON в кавычках
+                        if raw_text.startswith('"') and raw_text.endswith('"'):
+                            data = json.loads(raw_text[1:-1])
+                        else:
+                            data = {'raw': raw_text}
                 else:
-                    data = {'message': raw_text}
+                    data = {'raw': raw_text}
                     
             except Exception as e:
-                logger.error(f"❌ Ошибка обработки raw данных: {e}")
-                data = {'error': str(e), 'raw_bytes': len(request.data)}
+                logger.error(f"❌ Ошибка обработки raw: {e}")
+                data = {'error': str(e)}
         
-        # 4. GET параметры (для тестирования через браузер)
-        elif request.method == 'GET':
+        # 3. Form-data
+        if not data and request.form:
+            data = request.form.to_dict()
+        
+        # 4. GET параметры
+        if not data and request.args:
             data = request.args.to_dict()
-            logger.info(f"🔗 GET параметры: {data}")
         
-        # 5. Если ничего не получили
+        # Если данных нет
         if not data:
-            logger.warning("⚠️ Пустой запрос без данных")
             return jsonify({
                 "status": "warning",
-                "message": "Empty request received",
-                "tip": "Send JSON with symbol, signal, price"
+                "message": "No data received",
+                "tip": "Send JSON like: {\"symbol\":\"BTC\",\"signal\":\"BUY\",\"price\":50000}"
             }), 200
         
-        # 🔍 ИЗВЛЕКАЕМ ДАННЫЕ СИГНАЛА
-        signal_info = extract_signal_info(data)
-        symbol = signal_info['symbol']
-        signal = signal_info['signal']
-        price = signal_info['price']
+        logger.info(f"📥 Получены данные: {json.dumps(data, ensure_ascii=False)[:500]}")
         
-        # Если нет обязательных данных
-        if symbol == 'UNKNOWN' or signal == 'UNKNOWN' or price == 0:
-            logger.warning(f"⚠️ Неполные данные: {symbol} {signal} ${price}")
+        # Извлекаем основные поля
+        symbol = str(data.get('symbol') or data.get('ticker') or 'UNKNOWN').upper()[:50]
         
-        # 📊 СОХРАНЕНИЕ В БАЗУ
+        # Сигнал может быть в разных полях
+        signal_raw = data.get('signal') or data.get('action') or data.get('order') or 'UNKNOWN'
+        signal = str(signal_raw)[:50].upper()
+        
+        # Цена
+        price_str = data.get('price') or data.get('close') or '0'
+        try:
+            price = float(price_str)
+        except:
+            price = 0.0
+        
+        # Сохраняем в базу
         conn = get_db_connection()
         if not conn:
             return jsonify({"error": "Database not connected"}), 500
@@ -251,16 +252,16 @@ def webhook():
         cur = conn.cursor()
         
         try:
-            # Сохраняем в основную таблицу
+            # Вставляем в trading_signals (без source сначала)
             cur.execute('''
-                INSERT INTO trading_signals (symbol, signal, price, source)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO trading_signals (symbol, signal, price)
+                VALUES (%s, %s, %s)
                 RETURNING id, timestamp
-            ''', (symbol, signal, price, content_type))
+            ''', (symbol, signal, price))
             
             signal_id, timestamp = cur.fetchone()
             
-            # Сохраняем ВСЕ исходные данные в KIRA таблицу
+            # Сохраняем все данные в KIRA таблицу
             cur.execute('''
                 INSERT INTO kiria_full_signals (signal_id, full_data)
                 VALUES (%s, %s)
@@ -268,16 +269,11 @@ def webhook():
             
             conn.commit()
             
-            # 📝 ЛОГИРОВАНИЕ
             logger.info(f"✅ Сигнал сохранен: {symbol} {signal} ${price:.2f} (ID: {signal_id})")
             
-            # Проверяем наличие KIRA данных
+            # Проверяем KIRA данные
             kira_keys = ['monitoring_minutes', 'delta_15min', 'bull_percent', 'dominance']
             has_kira = any(key in data for key in kira_keys)
-            
-            if has_kira:
-                kira_info = {k: data.get(k) for k in kira_keys if k in data}
-                logger.info(f"   📊 KIRA данные: {kira_info}")
             
         except Exception as db_error:
             conn.rollback()
@@ -287,7 +283,6 @@ def webhook():
             cur.close()
             conn.close()
         
-        # ✅ УСПЕШНЫЙ ОТВЕТ
         return jsonify({
             "status": "success",
             "message": "Signal received and saved",
@@ -297,51 +292,20 @@ def webhook():
                 "signal": signal,
                 "price": price,
                 "timestamp": timestamp.isoformat() if timestamp else None,
-                "format_received": content_type,
                 "has_kira_data": has_kira
             }
         }), 200
         
     except Exception as e:
-        logger.error(f"❌ Ошибка вебхука: {e}", exc_info=True)
+        logger.error(f"❌ Ошибка вебхука: {e}")
         return jsonify({
             "status": "error",
-            "error": str(e),
-            "tip": "Check your data format. Send JSON like: {\"symbol\":\"BTC\",\"signal\":\"BUY\",\"price\":50000}"
+            "error": str(e)
         }), 500
 
-# 🗑️ Очистка всех сигналов (для тестирования)
-@app.route('/delete_all', methods=['DELETE', 'POST'])
-def delete_all_signals():
-    """Удаляет все сигналы (осторожно!)"""
-    try:
-        conn = get_db_connection()
-        if not conn:
-            return jsonify({"error": "Database not connected"}), 500
-        
-        cur = conn.cursor()
-        
-        # Удаляем в правильном порядке из-за foreign key
-        cur.execute("DELETE FROM kiria_full_signals")
-        cur.execute("DELETE FROM trading_signals")
-        
-        conn.commit()
-        cur.close()
-        conn.close()
-        
-        logger.warning("⚠️ Все сигналы удалены!")
-        
-        return jsonify({
-            "status": "success",
-            "message": "All signals deleted",
-            "timestamp": datetime.now().isoformat()
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# 📊 Получение всех сигналов
 @app.route('/signals')
 def get_signals():
+    """Получение всех сигналов (исправленная версия без source)"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -351,23 +315,51 @@ def get_signals():
         offset = int(request.args.get('offset', 0))
         
         cur = conn.cursor()
-        cur.execute('''
-            SELECT id, symbol, signal, price, timestamp, source 
-            FROM trading_signals 
-            ORDER BY timestamp DESC 
-            LIMIT %s OFFSET %s
-        ''', (limit, offset))
         
-        signals = []
-        for row in cur.fetchall():
-            signals.append({
-                "id": row[0],
-                "symbol": row[1],
-                "signal": row[2],
-                "price": float(row[3]),
-                "timestamp": row[4].isoformat() if row[4] else None,
-                "source": row[5]
-            })
+        # Проверяем есть ли колонка source
+        cur.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name='trading_signals' AND column_name='source'
+        """)
+        has_source = cur.fetchone() is not None
+        
+        # Формируем запрос в зависимости от структуры таблицы
+        if has_source:
+            cur.execute('''
+                SELECT id, symbol, signal, price, timestamp, source 
+                FROM trading_signals 
+                ORDER BY timestamp DESC 
+                LIMIT %s OFFSET %s
+            ''', (limit, offset))
+            
+            signals = []
+            for row in cur.fetchall():
+                signals.append({
+                    "id": row[0],
+                    "symbol": row[1],
+                    "signal": row[2],
+                    "price": float(row[3]),
+                    "timestamp": row[4].isoformat() if row[4] else None,
+                    "source": row[5]
+                })
+        else:
+            cur.execute('''
+                SELECT id, symbol, signal, price, timestamp 
+                FROM trading_signals 
+                ORDER BY timestamp DESC 
+                LIMIT %s OFFSET %s
+            ''', (limit, offset))
+            
+            signals = []
+            for row in cur.fetchall():
+                signals.append({
+                    "id": row[0],
+                    "symbol": row[1],
+                    "signal": row[2],
+                    "price": float(row[3]),
+                    "timestamp": row[4].isoformat() if row[4] else None
+                })
         
         cur.execute("SELECT COUNT(*) FROM trading_signals")
         total = cur.fetchone()[0]
@@ -379,15 +371,16 @@ def get_signals():
             "status": "success",
             "count": len(signals),
             "total": total,
+            "has_source_column": has_source,
             "signals": signals
         })
     except Exception as e:
         logger.error(f"Error in get_signals: {e}")
         return jsonify({"error": str(e)}), 500
 
-# 📈 Получение KIRA сигналов
 @app.route('/kiria/signals')
 def get_kiria_signals():
+    """Получение KIRA сигналов"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -430,24 +423,18 @@ def get_kiria_signals():
             except:
                 full_data = {}
             
-            # Извлекаем KIRA поля
-            kira_data = {
-                "monitoring_minutes": full_data.get('monitoring_minutes', 0),
-                "delta_15min": full_data.get('delta_15min', 0),
-                "total_delta_90min": full_data.get('total_delta_90min', 0),
-                "bull_percent": full_data.get('bull_percent', 50),
-                "dominance": full_data.get('dominance', 'NEUTRAL'),
-                "channel_data": full_data.get('channel_data', {})
-            }
-            
             signals.append({
                 "id": row[0],
                 "symbol": row[1],
                 "signal": row[2],
                 "price": float(row[3]),
                 "timestamp": row[4].isoformat() if row[4] else None,
-                "kira_data": kira_data,
-                "full_data": full_data
+                "kira_data": {
+                    "monitoring_minutes": full_data.get('monitoring_minutes', 0),
+                    "delta_15min": full_data.get('delta_15min', 0),
+                    "bull_percent": full_data.get('bull_percent', 50),
+                    "dominance": full_data.get('dominance', 'NEUTRAL')
+                }
             })
         
         cur.close()
@@ -464,11 +451,8 @@ def get_kiria_signals():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
-    logger.info(f"🚀 KIRA TradingView Proxy запущен на порту {port}")
-    logger.info(f"🌐 Доступ по URL: https://tradingview-proxy-h71n.onrender.com")
-    logger.info(f"✅ Вебхук URL: https://tradingview-proxy-h71n.onrender.com/webhook")
-    logger.info(f"📊 KIRA эндпоинты:")
-    logger.info(f"   - GET /signals - все сигналы")
-    logger.info(f"   - GET /kiria/signals - KIRA сигналы")
-    logger.info(f"   - DELETE /delete_all - очистить все (для тестов)")
+    logger.info(f"🚀 Исправленный сервер запущен на порту {port}")
+    logger.info(f"🌐 URL: https://tradingview-proxy-h71n.onrender.com")
+    logger.info(f"✅ Вебхук: https://tradingview-proxy-h71n.onrender.com/webhook")
+    logger.info(f"🛠️  Чтобы исправить структуру БД открой: /fix_db")
     app.run(host='0.0.0.0', port=port, debug=False)
